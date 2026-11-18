@@ -1,18 +1,22 @@
 
+import os
+import re
+import time
+import unicodedata
+
 import streamlit as st
 import fitz
-import re
-import unicodedata
-import os
 import faiss
 import numpy as np
 
 from sentence_transformers import SentenceTransformer
 from google import genai
+from google.genai import errors
 
-# ---------------------------
-# PAGE CONFIGURATION
-# ---------------------------
+
+# --------------------------------
+# 1. PAGE CONFIGURATION
+# --------------------------------
 
 st.set_page_config(
     page_title="AI Document Assistant",
@@ -23,238 +27,372 @@ st.set_page_config(
 st.title("📚 AI Document Assistant")
 st.write("Upload your PDF and ask questions about it.")
 
-# ---------------------------
-# GEMINI API CONFIGURATION
-# ---------------------------
 
-api_key = os.environ.get("GEMINI_API_KEY")
+# --------------------------------
+# 2. GEMINI API CONFIGURATION
+# --------------------------------
+
+try:
+    api_key = st.secrets["GEMINI_API_KEY"]
+except Exception:
+    api_key = os.environ.get("GEMINI_API_KEY")
 
 if not api_key:
-    st.error("Gemini API key not configured.")
+    st.error(
+        "Gemini API key is missing. "
+        "Please add GEMINI_API_KEY in Streamlit Secrets."
+    )
     st.stop()
 
 client = genai.Client(api_key=api_key)
 
-# ---------------------------
-# LOAD EMBEDDING MODEL
-# ---------------------------
+MODEL_NAME = "gemini-3.8-flash"
+
+
+# --------------------------------
+# 3. LOAD EMBEDDING MODEL
+# --------------------------------
 
 @st.cache_resource
-def load_model():
-
+def load_embedding_model():
     return SentenceTransformer(
         "sentence-transformers/all-MiniLM-L6-v2"
     )
 
-model = load_model()
 
-# ---------------------------
-# TEXT CLEANING
-# ---------------------------
+with st.spinner("Loading embedding model..."):
+    embedding_model = load_embedding_model()
+
+
+# --------------------------------
+# 4. TEXT CLEANING
+# --------------------------------
 
 def clean_text(text):
 
     text = unicodedata.normalize("NFKC", text)
+
     text = text.replace("\x00", "")
+
     text = re.sub(r"[ \t]+", " ", text)
+
     text = re.sub(r"\n+", "\n", text)
 
     return text.strip()
 
-# ---------------------------
-# PDF EXTRACTION AND CHUNKING
-# ---------------------------
+
+# --------------------------------
+# 5. PDF EXTRACTION AND CHUNKING
+# --------------------------------
 
 def process_pdf(pdf_file, chunk_size=500, overlap=100):
 
     chunks = []
 
-    doc = fitz.open(
-        stream=pdf_file.getvalue(),
+    pdf_bytes = pdf_file.getvalue()
+
+    with fitz.open(
+        stream=pdf_bytes,
         filetype="pdf"
-    )
+    ) as pdf:
 
-    for page_number, page in enumerate(doc):
+        for page_number, page in enumerate(pdf):
 
-        text = clean_text(page.get_text("text"))
+            text = page.get_text("text")
 
-        start = 0
+            text = clean_text(text)
 
-        while start < len(text):
+            if not text:
+                continue
 
-            end = start + chunk_size
+            words = text.split()
 
-            chunk_text = text[start:end]
+            start = 0
 
-            if chunk_text.strip():
+            while start < len(words):
 
-                chunks.append({
-                    "text": chunk_text,
-                    "page": page_number + 1,
-                    "source": pdf_file.name
-                })
+                end = start + chunk_size
 
-            start += chunk_size - overlap
+                chunk_text = " ".join(words[start:end])
 
-    doc.close()
+                if chunk_text.strip():
+
+                    chunks.append({
+                        "text": chunk_text,
+                        "page": page_number + 1,
+                        "source": pdf_file.name
+                    })
+
+                if end >= len(words):
+                    break
+
+                start += chunk_size - overlap
 
     return chunks
 
-# ---------------------------
-# CREATE VECTOR DATABASE
-# ---------------------------
+
+# --------------------------------
+# 6. CREATE FAISS VECTOR STORE
+# --------------------------------
 
 def create_vector_store(chunks):
 
-    texts = [chunk["text"] for chunk in chunks]
+    texts = [
+        chunk["text"]
+        for chunk in chunks
+    ]
 
-    embeddings = model.encode(
+    embeddings = embedding_model.encode(
         texts,
         batch_size=16,
         show_progress_bar=False,
         normalize_embeddings=True
     )
 
-    embeddings = embeddings.astype("float32")
+    embeddings = np.asarray(
+        embeddings,
+        dtype="float32"
+    )
 
-    index = faiss.IndexFlatIP(embeddings.shape[1])
+    dimension = embeddings.shape[1]
+
+    index = faiss.IndexFlatIP(dimension)
 
     index.add(embeddings)
 
     return index
 
-# ---------------------------
-# DOCUMENT RETRIEVAL
-# ---------------------------
+
+# --------------------------------
+# 7. RETRIEVE RELEVANT DOCUMENTS
+# --------------------------------
 
 def search_documents(question, index, chunks, top_k=5):
 
-    query_embedding = model.encode(
+    query_embedding = embedding_model.encode(
         [question],
         normalize_embeddings=True
     )
 
-    query_embedding = query_embedding.astype("float32")
+    query_embedding = np.asarray(
+        query_embedding,
+        dtype="float32"
+    )
 
-    k = min(top_k, index.ntotal)
+    k = min(top_k, len(chunks))
 
-    scores, indices = index.search(query_embedding, k)
+    scores, indices = index.search(
+        query_embedding,
+        k
+    )
 
-    results = []
+    retrieved_docs = []
 
     for score, idx in zip(scores[0], indices[0]):
 
-        if idx == -1:
+        if idx < 0:
             continue
 
-        results.append({
-            **chunks[idx],
-            "similarity_score": float(score)
-        })
+        doc = chunks[idx].copy()
 
-    return results
+        doc["similarity_score"] = float(score)
 
-# ---------------------------
-# GEMINI ANSWER GENERATION
-# ---------------------------
+        retrieved_docs.append(doc)
+
+    return retrieved_docs
+
+
+# --------------------------------
+# 8. GENERATE ANSWER USING GEMINI
+# --------------------------------
 
 def generate_answer(question, retrieved_docs):
 
-    context = ""
+    context = "\n\n".join([
 
-    for i, doc in enumerate(retrieved_docs):
+        f"Source: {doc['source']}\n"
+        f"Page: {doc['page']}\n"
+        f"Content: {doc['text']}"
 
-        context += f"""
-        Document {i+1}
-        Source: {doc['source']}
-        Page: {doc['page']}
-        Content: {doc['text']}
-        """
+        for doc in retrieved_docs
+    ])
 
     prompt = f"""
-    You are an AI document assistant.
+You are an AI Document Assistant.
 
-    Answer using ONLY the provided context.
+Answer the user's question using the provided document context.
 
-    Instructions:
-    1. Do not invent facts.
-    2. If the answer is unavailable, say so.
-    3. Give simple and clear answers.
-    4. Mention source filename and page number.
+Instructions:
+1. Use only the information in the provided context.
+2. Give clear and accurate answers.
+3. Explain difficult concepts in simple language.
+4. Do not make up information.
+5. If the answer is not available in the context,
+   clearly say that the document does not provide the answer.
+6. Mention relevant page numbers whenever possible.
 
-    Context:
-    {context}
+DOCUMENT CONTEXT:
 
-    Question:
-    {question}
+{context}
 
-    Answer:
-    """
+USER QUESTION:
 
-    response = client.models.generate_content(
-        model="gemini-3.8-flash",
-        contents=prompt
-    )
+{question}
 
-    return response.text
+ANSWER:
+"""
 
-# ---------------------------
-# PDF UPLOAD
-# ---------------------------
+    # Retry temporary Gemini API failures
+
+    for attempt in range(4):
+
+        try:
+
+            response = client.models.generate_content(
+                model=MODEL_NAME,
+                contents=prompt
+            )
+
+            if response.text:
+                return response.text
+
+            return "Gemini returned an empty response. Please try again."
+
+        except errors.APIError as e:
+
+            status_code = getattr(e, "code", None)
+
+            if status_code in [429, 500, 502, 503, 504]:
+
+                if attempt < 3:
+
+                    wait_time = 2 ** (attempt + 1)
+
+                    time.sleep(wait_time)
+
+                    continue
+
+                return (
+                    "Gemini is temporarily unavailable or "
+                    "the API quota has been reached. "
+                    "Please try again later."
+                )
+
+            return (
+                f"Gemini API error ({status_code}). "
+                "Please check your API configuration and quota."
+            )
+
+        except Exception as e:
+
+            return (
+                "An unexpected error occurred while generating "
+                f"the answer: {str(e)}"
+            )
+
+
+# --------------------------------
+# 9. SESSION STATE
+# --------------------------------
+
+if "chunks" not in st.session_state:
+    st.session_state.chunks = None
+
+if "index" not in st.session_state:
+    st.session_state.index = None
+
+if "messages" not in st.session_state:
+    st.session_state.messages = []
+
+if "processed_filename" not in st.session_state:
+    st.session_state.processed_filename = None
+
+
+# --------------------------------
+# 10. PDF UPLOAD
+# --------------------------------
 
 uploaded_file = st.file_uploader(
     "Upload your PDF",
     type=["pdf"]
 )
 
-if uploaded_file:
+
+if uploaded_file is not None:
 
     if st.button("Process Document"):
 
-        with st.spinner("Processing your document..."):
+        with st.spinner(
+            "Extracting text and creating embeddings..."
+        ):
 
-            chunks = process_pdf(uploaded_file)
+            try:
 
-            if not chunks:
+                chunks = process_pdf(uploaded_file)
 
-                st.error("No readable text found in this PDF.")
+                if not chunks:
 
-            else:
+                    st.error(
+                        "No readable text was found in this PDF."
+                    )
 
-                index = create_vector_store(chunks)
+                else:
 
-                st.session_state["chunks"] = chunks
-                st.session_state["index"] = index
-                st.session_state["filename"] = uploaded_file.name
+                    index = create_vector_store(chunks)
 
-                st.session_state.messages = []
+                    st.session_state.chunks = chunks
 
-                st.success(
-                    f"Successfully processed {len(chunks)} chunks!"
+                    st.session_state.index = index
+
+                    st.session_state.messages = []
+
+                    st.session_state.processed_filename = (
+                        uploaded_file.name
+                    )
+
+                    st.success(
+                        f"Successfully processed {uploaded_file.name}"
+                    )
+
+                    st.info(
+                        f"Created {len(chunks)} text chunks."
+                    )
+
+            except Exception as e:
+
+                st.error(
+                    f"Document processing failed: {str(e)}"
                 )
 
-# ---------------------------
-# CHAT INTERFACE
-# ---------------------------
 
-if "messages" not in st.session_state:
-    st.session_state.messages = []
-
-for message in st.session_state.messages:
-
-    with st.chat_message(message["role"]):
-        st.markdown(message["content"])
+# --------------------------------
+# 11. CHAT INTERFACE
+# --------------------------------
 
 if (
-    "index" in st.session_state
-    and "chunks" in st.session_state
+    st.session_state.index is not None
+    and st.session_state.chunks is not None
 ):
 
+    st.subheader("Ask Questions About Your PDF")
+
+    # Display previous conversation
+
+    for message in st.session_state.messages:
+
+        with st.chat_message(message["role"]):
+
+            st.markdown(message["content"])
+
+
     question = st.chat_input(
-        "Ask a question about your PDF..."
+        "Ask a question about your document..."
     )
 
+
     if question:
+
+        # Display user question
 
         st.session_state.messages.append({
             "role": "user",
@@ -262,43 +400,72 @@ if (
         })
 
         with st.chat_message("user"):
+
             st.markdown(question)
+
+
+        # Retrieve relevant documents
+
+        with st.spinner("Searching relevant document sections..."):
+
+            retrieved_docs = search_documents(
+                question,
+                st.session_state.index,
+                st.session_state.chunks,
+                top_k=5
+            )
+
+
+        # Generate answer
 
         with st.chat_message("assistant"):
 
-            with st.spinner("Finding relevant information..."):
-
-                retrieved_docs = search_documents(
-                    question,
-                    st.session_state["index"],
-                    st.session_state["chunks"]
-                )
+            with st.spinner("Generating answer..."):
 
                 answer = generate_answer(
                     question,
                     retrieved_docs
                 )
 
-                st.markdown(answer)
+            st.markdown(answer)
 
-                with st.expander("View source documents"):
+            # Display source documents
 
-                    for doc in retrieved_docs:
+            with st.expander("View source documents"):
 
-                        st.write("Source:", doc["source"])
-                        st.write("Page:", doc["page"])
-                        st.write(
-                            "Similarity:",
-                            round(doc["similarity_score"], 4)
-                        )
-                        st.write(doc["text"])
-                        st.divider()
+                for doc in retrieved_docs:
+
+                    st.write(
+                        "Source:",
+                        doc["source"]
+                    )
+
+                    st.write(
+                        "Page:",
+                        doc["page"]
+                    )
+
+                    st.write(
+                        "Similarity:",
+                        round(doc["similarity_score"], 4)
+                    )
+
+                    st.write(doc["text"])
+
+                    st.divider()
+
+
+        # Save assistant response
 
         st.session_state.messages.append({
             "role": "assistant",
             "content": answer
         })
 
+
 else:
 
-    st.info("Please upload and process a PDF to start chatting.")
+    st.info(
+        "Please upload and process a PDF to start chatting."
+    )
+
