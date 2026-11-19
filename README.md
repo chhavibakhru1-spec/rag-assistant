@@ -4,7 +4,7 @@ An AI-powered document question-answering application that allows users to inter
 
 ## Live Demo
 
-[Try the Live Application](https://rag-assistant-hvkbtjwxsmk7ggw6vc6k7z.streamlit.app/)
+[Try the Live Application](https://rag-assistant-5safvzxkhmxhfo7tha8og6.streamlit.app/)
 
 ## Overview
 
